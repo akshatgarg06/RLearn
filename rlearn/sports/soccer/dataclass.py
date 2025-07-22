@@ -406,6 +406,47 @@ class Observation_PVS(BaseModel):
                 raise TypeError("players must be a list of Player")
         return v
 
+class Observation_PVSS(BaseModel):
+    """Base observation class for PVSS state representation"""
+    ball: Ball
+    players: List[Player]  # without ego_player
+    ego_player: Player
+    @classmethod
+    def from_state(cls, state: State_PVSS, ego_player: Player) -> "Observation_PVSS":
+        """Create observation from state centered around ego player"""
+        raise NotImplementedError
+
+    def to_tensor(self) -> torch.Tensor:
+        """Convert observation to tensor representation"""
+        raise NotImplementedError
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Observation_PVSS":
+        """Create observation from dictionary"""
+        raise NotImplementedError
+
+    def to_dict(self) -> dict:
+        """Convert observation to dictionary"""
+        raise NotImplementedError
+
+    @field_validator("players")
+    @classmethod
+    def players_must_be_list_of_players(cls, v):  # type: ignore
+        """Validate players field"""
+        if not isinstance(v, list):
+            raise TypeError("players must be a list")
+        for player in v:
+            if not isinstance(player, Player):
+                raise TypeError("players must be a list of Player")
+        return v
+
+    @field_validator("relative_state", "absolute_state")
+    @classmethod
+    def validate_state_components(cls, v):  # type: ignore
+        """Validate state components"""
+        if not isinstance(v, (RelativeState, AbsoluteState)):
+            raise TypeError(f"Expected RelativeState/AbsoluteState, got {type(v)}")
+        return v
 
 class SimpleObservation_PVS(Observation_PVS):
     @classmethod
@@ -463,8 +504,93 @@ class SimpleObservation_PVS(Observation_PVS):
             ball=Ball.from_dict(data["ball"]),
             players=[Player.from_dict(player) for player in data["players"]],
             ego_player=Player.from_dict(data["ego_player"]),
+
+        )
+    
+class SimpleObservation_PVSS(Observation_PVSS):
+    @classmethod
+    def from_state(cls, state: State_PVSS, ego_player: Player) -> "SimpleObservation_PVSS":
+        ego_position = ego_player.position
+        ego_player_id = ego_player.player_id
+        
+        players = [
+            Player(
+                index=player.index,
+                team_name=player.team_name,
+                player_name=player.player_name,
+                player_id=player.player_id,
+                player_role=player.player_role,
+                position=Position(
+                    x=player.position.x - ego_position.x,
+                    y=player.position.y - ego_position.y,
+                ),
+                velocity=player.velocity,
+                action=player.action,
+                action_probs=player.action_probs,
+            )
+            for player in state.players
+            if player.player_id != ego_player_id
+        ]
+        
+        return cls(
+            ball=Ball(
+                position=Position(
+                    x=state.ball.position.x - ego_position.x,
+                    y=state.ball.position.y - ego_position.y,
+                ),
+                velocity=state.ball.velocity
+            ),
+            players=players,
+            ego_player=ego_player,
+            relative_state=state.relative_state,
+            absolute_state=state.absolute_state
         )
 
+    def to_tensor(self) -> torch.Tensor:
+        data = []
+        # Player relative positions/velocities
+        for player in self.players:
+            data.extend([player.position.x, player.position.y, 
+                        player.velocity.x, player.velocity.y])
+        
+        # Ball relative position/velocity
+        data.extend([self.ball.position.x, self.ball.position.y,
+                    self.ball.velocity.x, self.ball.velocity.y])
+        
+        # Ego player absolute position/velocity
+        data.extend([self.ego_player.position.x, self.ego_player.position.y,
+                    self.ego_player.velocity.x, self.ego_player.velocity.y])
+        
+        # Selected decision features
+        data.extend(self.relative_state.onball.dist_ball_opponent[:2])
+        data.append(max(self.relative_state.onball.dribble_score))
+        data.append(self.relative_state.onball.shot_score)
+        data.extend(self.relative_state.offball.fast_space[:3])
+        
+        return torch.tensor(data)
+
+    @property
+    def dimension(self) -> int:
+        return len(self.to_tensor())
+
+    def to_dict(self):
+        return {
+            "ball": self.ball.to_dict(),
+            "players": [player.to_dict() for player in self.players],
+            "ego_player": self.ego_player.to_dict(),
+            "relative_state": self.relative_state.to_dict(),
+            "absolute_state": self.absolute_state.to_dict(),
+        }
+
+    @classmethod
+    def from_dict(cls, data):
+        return cls(
+            ball=Ball.from_dict(data["ball"]),
+            players=[Player.from_dict(player) for player in data["players"]],
+            ego_player=Player.from_dict(data["ego_player"]),
+            relative_state=RelativeState.from_dict(data["relative_state"]),
+            absolute_state=AbsoluteState.from_dict(data["absolute_state"]),
+        )
 
 class SimpleObservationAction_PVS(BaseModel):
     player: Player
@@ -488,7 +614,28 @@ class SimpleObservationAction_PVS(BaseModel):
             action=data["action"],
             reward=data["reward"],
         )
+class SimpleObservationAction_PVSS(BaseModel):
+    player: Player
+    observation: SimpleObservation_PVSS
+    action: str
+    reward: float
 
+    def to_dict(self):
+        return {
+            "player": self.player.to_dict(),
+            "observation": self.observation.to_dict(),
+            "action": self.action,
+            "reward": self.reward,
+        }
+
+    @classmethod
+    def from_dict(cls, data):
+        return cls(
+            player=Player.from_dict(data["player"]),
+            observation=SimpleObservation_PVSS.from_dict(data["observation"]),
+            action=data["action"],
+            reward=data["reward"],
+        )
 
 class SimpleObservationActionSequence_PVS(BaseModel):
     game_id: str
@@ -519,6 +666,34 @@ class SimpleObservationActionSequence_PVS(BaseModel):
             sequence=[SimpleObservationAction_PVS.from_dict(obs_action) for obs_action in data["sequence"]],
         )
 
+class SimpleObservationActionSequence_PVSS(BaseModel):
+    game_id: str
+    half: str
+    sequence_id: int
+    team_name_attack: str
+    team_name_defense: str
+    sequence: List[SimpleObservationAction_PVSS]
+
+    def to_dict(self):
+        return {
+            "game_id": self.game_id,
+            "half": self.half,
+            "sequence_id": self.sequence_id,
+            "team_name_attack": self.team_name_attack,
+            "team_name_defense": self.team_name_defense,
+            "sequence": [obs_action.to_dict() for obs_action in self.sequence],
+        }
+
+    @classmethod
+    def from_dict(cls, data):
+        return cls(
+            game_id=data["game_id"],
+            half=data["half"],
+            sequence_id=data["sequence_id"],
+            team_name_attack=data["team_name_attack"],
+            team_name_defense=data["team_name_defense"],
+            sequence=[SimpleObservationAction_PVSS.from_dict(obs_action) for obs_action in data["sequence"]],
+        )
 
 class Event_PVS(BaseModel):
     state: State_PVS
@@ -595,7 +770,195 @@ class Events_PVS(BaseModel):
             events=[Event_PVS.from_dict(event) for event in d["events"]],
         )
 
+class Event_PVSS(BaseModel):
+    state: State_PVSS
+    action: List[str] | None = None
+    reward: float
 
+    @model_validator(mode="after")
+    def set_and_validate_action(self) -> "Event_PVSS":
+        if self.action is None:
+            self.action = [player.action for player in self.state.players]
+        for action in self.action:
+            if not isinstance(action, str):
+                raise TypeError("action must be a list of str")
+        return self
+
+    def to_dict(self) -> dict:
+        return {
+            "state": self.state.to_dict(),
+            "action": self.action,
+            "reward": self.reward,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Event_PVSS":
+        return cls(
+            state=State_PVSS.from_dict(d["state"]),
+            action=d["action"],
+            reward=d["reward"],
+        )
+
+
+class Events_PVSS(BaseModel):
+    game_id: str
+    half: str
+    sequence_id: int
+    sequence_start_frame: str
+    sequence_end_frame: str
+    team_name_attack: str
+    team_name_defense: str
+    events: List[Event_PVSS]
+
+    @field_validator("events")
+    @classmethod
+    def events_must_be_list_of_events(cls, v):  # type: ignore
+        if not isinstance(v, list):
+            raise TypeError("events must be a list")
+        for event in v:
+            if not isinstance(event, Event_PVSS):
+                raise TypeError("events must be a list of Event_PVSS")
+        return v
+
+    def to_dict(self) -> dict:
+        return {
+            "game_id": self.game_id,
+            "half": self.half,
+            "sequence_id": self.sequence_id,
+            "sequence_start_frame": self.sequence_start_frame,
+            "sequence_end_frame": self.sequence_end_frame,
+            "team_name_attack": self.team_name_attack,
+            "team_name_defense": self.team_name_defense,
+            "events": [event.to_dict() for event in self.events],
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Events_PVSS":
+        return cls(
+            game_id=d["game_id"],
+            half=d["half"],
+            sequence_id=d["sequence_id"],
+            sequence_start_frame=d["sequence_start_frame"],
+            sequence_end_frame=d["sequence_end_frame"],
+            team_name_attack=d["team_name_attack"],
+            team_name_defense=d["team_name_defense"],
+            events=[Event_PVSS.from_dict(event) for event in d["events"]],
+        )
+        
+class State_PVSS(BaseModel):
+    """Combines position/velocity features with some decision-making features"""
+    ball: Ball
+    players: List[Player]
+    attack_players: List[Player]
+    defense_players: List[Player]
+
+    @field_validator("attack_players", "defense_players")
+    @classmethod
+    def players_must_be_list_of_players(cls, v):  # type: ignore
+        if not isinstance(v, list):
+            raise TypeError("players must be a list")
+        for player in v:
+            if not isinstance(player, Player):
+                raise TypeError("players must be a list of Player")
+        return v
+
+    def to_dict(self) -> dict:
+        return {
+            "ball": self.ball.to_dict(),
+            "players": [player.to_dict() for player in self.players],
+            "attack_players": [player.to_dict() for player in self.attack_players],
+            "defense_players": [player.to_dict() for player in self.defense_players],
+            "relative_state": self.relative_state.to_dict(),
+            "absolute_state": self.absolute_state.to_dict(),
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "State_PVSS":
+        return cls(
+            ball=Ball.from_dict(d["ball"]),
+            players=[Player.from_dict(player) for player in d["players"]],
+            attack_players=[Player.from_dict(player) for player in d["attack_players"]],
+            defense_players=[Player.from_dict(player) for player in d["defense_players"]],
+            relative_state=RelativeState.from_dict(d["relative_state"]),
+            absolute_state=AbsoluteState.from_dict(d["absolute_state"]),
+        )
+
+class Observation_PVSS(BaseModel):
+    ball: Ball
+    players: List[Player]  # without ego_player
+    ego_player: Player
+
+    @classmethod
+    def from_state(cls, state: State_PVSS, ego_player: Player) -> "Observation_PVSS":
+        ego_position = ego_player.position
+        ego_player_id = ego_player.player_id
+        
+        players = [
+            Player(
+                index=player.index,
+                team_name=player.team_name,
+                player_name=player.player_name,
+                player_id=player.player_id,
+                player_role=player.player_role,
+                position=Position(
+                    x=player.position.x - ego_position.x,
+                    y=player.position.y - ego_position.y,
+                ),
+                velocity=player.velocity,
+                action=player.action,
+                action_probs=player.action_probs,
+            )
+            for player in state.players
+            if player.player_id != ego_player_id
+        ]
+        
+        return cls(
+            ball=state.ball,
+            players=players,
+            ego_player=ego_player,
+            relative_state=state.relative_state,
+            absolute_state=state.absolute_state
+        )
+
+    def to_tensor(self) -> torch.Tensor:
+        # Combine position/velocity features with selected decision-making features
+        data = []
+        
+        # Position/Velocity features (from PVS)
+        for player in self.players:
+            data.extend([player.position.x, player.position.y, 
+                        player.velocity.x, player.velocity.y])
+            
+        data.extend([self.ball.position.x, self.ball.position.y, 
+                    self.ball.velocity.x, self.ball.velocity.y])
+        
+        data.extend([self.ego_player.position.x, self.ego_player.position.y,
+                    self.ego_player.velocity.x, self.ego_player.velocity.y])
+        
+        # Selected decision-making features (from EDMS)
+        data.extend(self.relative_state.onball.dist_ball_opponent[:2])
+        data.extend(self.relative_state.onball.dribble_score[:3])
+        data.append(self.relative_state.onball.shot_score)
+        
+        return torch.tensor(data)
+    def to_dict(self):
+        return {
+            "ball": self.ball.to_dict(),
+            "players": [player.to_dict() for player in self.players],
+            "ego_player": self.ego_player.to_dict(),
+            "relative_state": self.relative_state.to_dict(),
+            "absolute_state": self.absolute_state.to_dict(),
+        }
+    @classmethod
+    def from_dict(cls, data):
+        return cls(
+            ball=Ball.from_dict(data["ball"]),
+            players=[Player.from_dict(player) for player in data["players"]],
+            ego_player=Player.from_dict(data["ego_player"]),
+            relative_state=RelativeState.from_dict(data["relative_state"]),
+            absolute_state=AbsoluteState.from_dict(data["absolute_state"]),
+        )
+    
 # Extendable Dicision Making Features
 class OnBall(BaseModel):
     dist_ball_opponent: List[float]
@@ -785,8 +1148,7 @@ class State_EDMS(BaseModel):
             absolute_state=AbsoluteState(**d["absolute_state"]),
             raw_state=RawState(**d["raw_state"]),
         )
-
-
+    
 # Reinforcement Learning
 class OnBall_RL(BaseModel):
     dist_ball_opponent: List[float]
